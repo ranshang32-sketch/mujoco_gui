@@ -13,7 +13,8 @@ class RenderWidget(QWidget):
         self.engine = engine
         self._image = QImage()
         self._last_mouse_pos = None
-        self.setMinimumSize(640, 480)
+        # 工作台左右还有模型树和属性面板，因此只保留合理的最小画面尺寸。
+        self.setMinimumSize(420, 320)
         self.setStyleSheet("background: #20242a;")
 
     def refresh_frame(self) -> None:
