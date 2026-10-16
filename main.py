@@ -3,6 +3,9 @@
 import sys
 from pathlib import Path
 
+# On this Windows setup, MuJoCo must initialize before Qt loads its OpenGL DLLs.
+import mujoco  # noqa: F401
+
 from PySide6.QtGui import QFont, QFontDatabase
 from PySide6.QtWidgets import QApplication
 

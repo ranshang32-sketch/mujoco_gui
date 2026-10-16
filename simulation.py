@@ -1,6 +1,6 @@
 """MuJoCo 仿真逻辑。
 
-这个文件不知道按钮、输入框或窗口布局，只管理 model、data、控制器和渲染器。
+这个文件不知道按钮、输入框或窗口布局，只管理 model、data、物理步进和渲染器。
 """
 
 from dataclasses import dataclass
@@ -9,8 +9,6 @@ import time
 
 import mujoco
 import numpy as np
-
-from controller import FirstJointPDController
 
 
 @dataclass
@@ -32,7 +30,6 @@ class SimulationEngine:
         self.model: mujoco.MjModel | None = None
         self.data: mujoco.MjData | None = None
         self.model_path: Path | None = None
-        self.controller = FirstJointPDController()
         self._renderer: mujoco.Renderer | None = None
         self._render_size = (0, 0)
         self.camera = mujoco.MjvCamera()
@@ -45,10 +42,6 @@ class SimulationEngine:
     @property
     def is_loaded(self) -> bool:
         return self.model is not None and self.data is not None
-
-    @property
-    def target(self) -> float:
-        return self.controller.target
 
     @property
     def speed_multiplier(self) -> float:
@@ -64,12 +57,12 @@ class SimulationEngine:
         self.model = self._load_model_windows_safe(path)
         self.data = mujoco.MjData(self.model)
         self.model_path = path
+        self._zero_controls()
         mujoco.mj_forward(self.model, self.data)
 
         mujoco.mjv_defaultCamera(self.camera)
         if hasattr(mujoco, "mjv_defaultFreeCamera"):
             mujoco.mjv_defaultFreeCamera(self.model, self.camera)
-        self.controller.reset(self.model, self.data)
         self._reset_clock()
 
     @staticmethod
@@ -94,10 +87,6 @@ class SimulationEngine:
 
         return mujoco.MjModel.from_xml_string(xml_text, assets=assets)
 
-    def set_target(self, value: float) -> None:
-        """GUI -> 仿真：接收界面输入的目标值。"""
-        self.controller.set_target(value)
-
     def get_model_info(self) -> dict[str, object]:
         """返回模型树和属性面板需要的基本信息。"""
         if not self.is_loaded:
@@ -109,6 +98,7 @@ class SimulationEngine:
             "nv": int(self.model.nv),
             "nu": int(self.model.nu),
             "joints": int(self.model.njnt),
+            "actuators": self._actuator_count(),
             "timestep": float(self.model.opt.timestep),
         }
 
@@ -139,7 +129,7 @@ class SimulationEngine:
         if not self.is_loaded:
             return []
         items = []
-        for actuator_id in range(self.model.nu):
+        for actuator_id in range(self._actuator_count()):
             name = mujoco.mj_id2name(
                 self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_id
             )
@@ -191,35 +181,112 @@ class SimulationEngine:
             return {}
 
         transmission = int(self.model.actuator_trntype[actuator_id])
-        joint_transmissions = {
-            int(mujoco.mjtTrn.mjTRN_JOINT),
-            int(mujoco.mjtTrn.mjTRN_JOINTINPARENT),
-        }
-        target = "其他传动类型"
-        if transmission in joint_transmissions:
-            joint_id = int(self.model.actuator_trnid[actuator_id, 0])
-            target = mujoco.mj_id2name(
-                self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_id
-            ) or f"关节 {joint_id}"
+        transmission_name, target = self._describe_actuator_transmission(
+            actuator_id, transmission
+        )
+        if hasattr(self.model, "actuator_ctrladr"):
+            ctrl_address = int(self.model.actuator_ctrladr[actuator_id])
+            ctrl_count = int(self.model.actuator_ctrlnum[actuator_id])
+        else:
+            # MuJoCo 旧版本中的执行器都是单输入，actuator_id就是ctrl地址。
+            ctrl_address = actuator_id
+            ctrl_count = 1
+        ctrl_slice = slice(ctrl_address, ctrl_address + ctrl_count)
+        ctrl_values = self.data.ctrl[ctrl_slice].copy()
+        ctrl_limited = self.model.actuator_ctrllimited[ctrl_slice].astype(bool).copy()
+        ctrl_ranges = self.model.actuator_ctrlrange[ctrl_slice].copy()
+        ctrl_names = []
+        for local_index in range(ctrl_count):
+            name = None
+            if hasattr(mujoco, "mj_actuatorInputName"):
+                name = mujoco.mj_actuatorInputName(
+                    self.model, actuator_id, local_index
+                )
+            ctrl_names.append(name or f"ctrl[{ctrl_address + local_index}]")
 
         details = dict(item)
         details.update(
             {
                 "target": target,
-                "ctrl": float(self.data.ctrl[actuator_id]),
-                "limited": bool(self.model.actuator_ctrllimited[actuator_id]),
+                "transmission": transmission_name,
+                "ctrl_address": ctrl_address,
+                "ctrl_count": ctrl_count,
+                "ctrl_names": ctrl_names,
+                "ctrl": ctrl_values,
+                "ctrl_limited": ctrl_limited,
+                "ctrl_ranges": ctrl_ranges,
             }
         )
-        if bool(self.model.actuator_ctrllimited[actuator_id]):
-            details["range"] = self.model.actuator_ctrlrange[actuator_id].copy()
         return details
+
+    def _actuator_count(self) -> int:
+        """兼容新旧MuJoCo：新版本区分nactuator和nu。"""
+        return int(getattr(self.model, "nactuator", self.model.nu))
+
+    def _describe_actuator_transmission(
+        self, actuator_id: int, transmission: int
+    ) -> tuple[str, str]:
+        """把执行器传动类型和目标对象转换成适合检查器显示的文字。"""
+        target_ids = self.model.actuator_trnid[actuator_id]
+        transmission_names = {
+            int(mujoco.mjtTrn.mjTRN_JOINT): "joint",
+            int(mujoco.mjtTrn.mjTRN_JOINTINPARENT): "jointinparent",
+            int(mujoco.mjtTrn.mjTRN_SLIDERCRANK): "slider-crank",
+            int(mujoco.mjtTrn.mjTRN_TENDON): "tendon",
+            int(mujoco.mjtTrn.mjTRN_SITE): "site",
+            int(mujoco.mjtTrn.mjTRN_BODY): "body",
+        }
+        if hasattr(mujoco.mjtTrn, "mjTRN_SO3"):
+            transmission_names[int(mujoco.mjtTrn.mjTRN_SO3)] = "so3"
+
+        transmission_name = transmission_names.get(transmission, "unknown")
+        target_id = int(target_ids[0])
+        object_type = None
+        object_label = "对象"
+        if transmission in {
+            int(mujoco.mjtTrn.mjTRN_JOINT),
+            int(mujoco.mjtTrn.mjTRN_JOINTINPARENT),
+        }:
+            object_type = mujoco.mjtObj.mjOBJ_JOINT
+            object_label = "关节"
+        elif transmission == int(mujoco.mjtTrn.mjTRN_TENDON):
+            object_type = mujoco.mjtObj.mjOBJ_TENDON
+            object_label = "肌腱"
+        elif transmission in {
+            int(mujoco.mjtTrn.mjTRN_SITE),
+            int(mujoco.mjtTrn.mjTRN_SLIDERCRANK),
+        }:
+            object_type = mujoco.mjtObj.mjOBJ_SITE
+            object_label = "Site"
+        elif transmission == int(mujoco.mjtTrn.mjTRN_BODY):
+            object_type = mujoco.mjtObj.mjOBJ_BODY
+            object_label = "Body"
+        elif (
+            hasattr(mujoco.mjtTrn, "mjTRN_SO3")
+            and transmission == int(mujoco.mjtTrn.mjTRN_SO3)
+        ):
+            # SO3既可用于球关节，也可用于带refsite的Site；第二个ID存在时
+            # 表示这里是Site到参考Site的相对朝向。
+            if int(target_ids[1]) >= 0:
+                object_type = mujoco.mjtObj.mjOBJ_SITE
+                object_label = "Site"
+            else:
+                object_type = mujoco.mjtObj.mjOBJ_JOINT
+                object_label = "关节"
+
+        if object_type is None or target_id < 0:
+            target = f"ID {target_id}"
+        else:
+            name = mujoco.mj_id2name(self.model, object_type, target_id)
+            target = name or f"{object_label} {target_id}"
+        return transmission_name, target
 
     def reset(self) -> None:
         if not self.is_loaded:
             return
         mujoco.mj_resetData(self.model, self.data)
+        self._zero_controls()
         mujoco.mj_forward(self.model, self.data)
-        self.controller.reset(self.model, self.data)
         self._reset_clock()
 
     def set_speed_multiplier(self, value: float) -> None:
@@ -286,10 +353,21 @@ class SimulationEngine:
         self._time_accumulator = 0.0
         self._physics_steps = 0
 
+    def step_once(self) -> bool:
+        """暂停状态下只推进一个物理步，成功时返回 True。"""
+        if not self.is_loaded or self._clock_running:
+            return False
+        self._step_once()
+        return True
+
+    def _zero_controls(self) -> None:
+        """平台当前不自动运行控制器，因此始终使用零控制输入。"""
+        if self.is_loaded and self.model.nu:
+            self.data.ctrl[:] = 0.0
+
     def _step_once(self) -> None:
-        """计算一次控制输入，然后推进一个 MuJoCo 物理步。"""
-        if self.model.nu:
-            self.data.ctrl[:] = self.controller.compute(self.model, self.data)
+        """保持零控制输入，然后推进一个 MuJoCo 物理步。"""
+        self._zero_controls()
         mujoco.mj_step(self.model, self.data)
         self._physics_steps += 1
 
@@ -302,7 +380,6 @@ class SimulationEngine:
         max_steps = 10_000  # 防止错误 timestep 导致 GUI 长时间卡住。
         steps = 0
         while self.data.time < end_time and steps < max_steps:
-            # GUI目标值 -> 控制器 -> data.ctrl -> MuJoCo。
             self._step_once()
             steps += 1
 

@@ -6,12 +6,13 @@
 from html import escape
 from pathlib import Path
 
+# On this Windows setup, MuJoCo must initialize before Qt loads its OpenGL DLLs.
+import mujoco  # noqa: F401
 import numpy as np
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
-    QDoubleSpinBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -119,10 +120,14 @@ class MainWindow(QMainWindow):
         self.start_button = QPushButton("开始")
         self.start_button.setProperty("role", "primary")
         self.start_button.clicked.connect(self._toggle_running)
+        self.step_button = QPushButton("单步")
+        self.step_button.setToolTip("暂停时推进一个 MuJoCo timestep")
+        self.step_button.clicked.connect(self._single_step)
         reset_button = QPushButton("重置")
         reset_button.clicked.connect(self._reset)
         layout.addWidget(load_button)
         layout.addWidget(self.start_button)
+        layout.addWidget(self.step_button)
         layout.addWidget(reset_button)
         return bar
 
@@ -289,36 +294,16 @@ class MainWindow(QMainWindow):
         self.property_label.setAlignment(Qt.AlignmentFlag.AlignTop)
         layout.addWidget(self.property_label)
 
-        separator = QFrame()
-        separator.setFrameShape(QFrame.Shape.HLine)
-        separator.setObjectName("separator")
-        layout.addWidget(separator)
-
-        control_title = QLabel("V1 示例控制")
+        control_title = QLabel("控制输入状态")
         control_title.setObjectName("subTitle")
         layout.addWidget(control_title)
-        control_note = QLabel("该目标仍控制第一个执行器和第一个自由度。本轮不修改控制器。")
+        control_note = QLabel(
+            "当前平台保持 data.ctrl 为零，不会自动运行示例控制器。"
+            "选择左侧执行器可以查看它对应的控制通道。"
+        )
         control_note.setObjectName("controlNote")
         control_note.setWordWrap(True)
         layout.addWidget(control_note)
-
-        control_box = QFrame()
-        control_box.setObjectName("controlBox")
-        control_layout = QVBoxLayout(control_box)
-        control_layout.setContentsMargins(12, 8, 12, 12)
-        target_caption = QLabel("目标值")
-        target_caption.setObjectName("mutedText")
-        self.target_input = QDoubleSpinBox()
-        self.target_input.setRange(-1000.0, 1000.0)
-        self.target_input.setDecimals(4)
-        self.target_input.setSingleStep(0.1)
-        apply_button = QPushButton("应用目标")
-        apply_button.setProperty("role", "primary")
-        apply_button.clicked.connect(self._apply_target)
-        control_layout.addWidget(target_caption)
-        control_layout.addWidget(self.target_input)
-        control_layout.addWidget(apply_button)
-        layout.addWidget(control_box)
         layout.addStretch()
         return panel
 
@@ -371,15 +356,14 @@ class MainWindow(QMainWindow):
             QLabel#propertyText { padding: 0 12px 14px 12px; color: #536171; }
             QLabel#subTitle { padding: 14px 12px 4px 12px; font-weight: 600; }
             QLabel#controlNote { padding: 0 12px 8px 12px; color: #7a8695; }
-            QFrame#controlBox { background: #ffffff; }
             QFrame#separator { color: #dce2e9; }
             QPushButton { background: #ffffff; border: 1px solid #cfd7e0; border-radius: 5px;
                           padding: 7px 12px; }
             QPushButton:hover { background: #f3f6f9; border-color: #aeb9c5; }
             QPushButton[role="primary"] { background: #1669b2; color: white; border-color: #1669b2; }
             QPushButton[role="primary"]:hover { background: #0f5d9f; }
-            QDoubleSpinBox, QComboBox { background: #ffffff; border: 1px solid #cfd7e0;
-                                       border-radius: 5px; padding: 6px; }
+            QComboBox { background: #ffffff; border: 1px solid #cfd7e0;
+                        border-radius: 5px; padding: 6px; }
             QSplitter::handle { background: #dce2e9; width: 1px; }
             QStatusBar#statusBar { background: #ffffff; border-top: 1px solid #dce2e9; color: #687586; }
             QLabel#runStatus { color: #2e7d50; padding-right: 14px; }
@@ -402,13 +386,13 @@ class MainWindow(QMainWindow):
             self.engine.pause_realtime()
             self._update_running_ui()
             self.engine.load_model(path)
-            self.target_input.setValue(self.engine.target)
+            self._update_running_ui()
             self._populate_model_tree()
             self._refresh_state()
             self.render_widget.refresh_frame()
             self.file_status_label.setText(path.name)
             self.message_status_label.setText("模型加载成功")
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001
             self.message_status_label.setText("模型加载失败")
             QMessageBox.critical(self, "模型加载失败", str(error))
 
@@ -449,11 +433,14 @@ class MainWindow(QMainWindow):
         self.model_tree.setCurrentItem(first_selectable or root)
 
         self.current_model_label.setText(
-            f"{info.get('name', '模型')}  ·  nq {info.get('nq', 0)}  nv {info.get('nv', 0)}  nu {info.get('nu', 0)}"
+            f"{info.get('name', '模型')}  ·  nq {info.get('nq', 0)}  nv {info.get('nv', 0)}  "
+            f"actuator {info.get('actuators', 0)}  ctrl {info.get('nu', 0)}"
         )
         self.model_summary_label.setText(
-            f"nq / nv / nu：{info.get('nq', 0)} / {info.get('nv', 0)} / {info.get('nu', 0)}\n"
-            f"关节：{info.get('joints', 0)}   Timestep：{info.get('timestep', 0):.6f} s"
+            f"nq / nv：{info.get('nq', 0)} / {info.get('nv', 0)}\n"
+            f"关节 / 执行器 / 控制输入：{info.get('joints', 0)} / "
+            f"{info.get('actuators', 0)} / {info.get('nu', 0)}\n"
+            f"Timestep：{info.get('timestep', 0):.6f} s"
         )
         self.timestep_label.setText(f"{float(info.get('timestep', 0)):.6f} s")
 
@@ -489,11 +476,14 @@ class MainWindow(QMainWindow):
             self.object_name_label.setText(str(details.get("name", "执行器")))
             rows = [
                 ("对象", f"Actuator {details.get('id', '-') }"),
+                ("传动类型", details.get("transmission", "-")),
                 ("作用对象", details.get("target", "-")),
-                ("当前控制量", f"{float(details.get('ctrl', 0.0)):.6f}"),
+                ("控制起始地址", details.get("ctrl_address", "-")),
+                ("控制通道数", details.get("ctrl_count", 0)),
+                ("当前控制值", self._format_array(details.get("ctrl", np.array([])))),
+                ("限制启用", self._format_bool_array(details.get("ctrl_limited", []))),
             ]
-            if details.get("limited"):
-                rows.append(("控制范围", self._format_array(details.get("range", np.array([])))))
+            rows.append(("控制范围", self._format_control_ranges(details)))
         else:
             details = self.engine.get_model_info()
             self.object_name_label.setText(str(details.get("name", "模型")))
@@ -502,6 +492,7 @@ class MainWindow(QMainWindow):
                 ("nv", details.get("nv", 0)),
                 ("nu", details.get("nu", 0)),
                 ("关节数", details.get("joints", 0)),
+                ("执行器数", details.get("actuators", 0)),
                 ("Timestep", f"{float(details.get('timestep', 0)):.6f} s"),
             ]
         self.property_label.setText(self._property_table(rows))
@@ -528,20 +519,22 @@ class MainWindow(QMainWindow):
     def _update_running_ui(self) -> None:
         self.start_button.setText("暂停" if self.is_running else "开始")
         self.run_status_label.setText("● 运行中" if self.is_running else "● 已暂停")
+        self.step_button.setEnabled(self.engine.is_loaded and not self.is_running)
+
+    def _single_step(self) -> None:
+        if not self.engine.step_once():
+            return
+        self._refresh_state()
+        self.render_widget.refresh_frame()
+        self.message_status_label.setText("已推进一个物理步")
 
     def _reset(self) -> None:
         self.is_running = False
         self._update_running_ui()
         self.engine.reset()
-        self.target_input.setValue(self.engine.target)
         self._refresh_state()
         self.render_widget.refresh_frame()
         self.message_status_label.setText("仿真已重置")
-
-    def _apply_target(self) -> None:
-        # GUI -> MuJoCo 的入口：界面只把目标交给SimulationEngine。
-        self.engine.set_target(self.target_input.value())
-        self.message_status_label.setText(f"目标已更新：{self.target_input.value():.4f}")
 
     def _change_speed(self) -> None:
         speed = float(self.speed_combo.currentData())
@@ -569,6 +562,35 @@ class MainWindow(QMainWindow):
         array = np.asarray(values)
         return np.array2string(array, precision=4, suppress_small=True, max_line_width=10_000)
 
+    @staticmethod
+    def _format_bool_array(values) -> str:
+        array = np.asarray(values, dtype=bool)
+        if array.size == 0:
+            return "[]"
+        return "[" + ", ".join("是" if value else "否" for value in array) + "]"
+
+    def _format_control_ranges(self, details: dict[str, object]) -> str:
+        limited = np.asarray(details.get("ctrl_limited", []), dtype=bool)
+        ranges = np.asarray(details.get("ctrl_ranges", []), dtype=float)
+        address = int(details.get("ctrl_address", 0))
+        names = list(details.get("ctrl_names", []))
+        if limited.size == 0:
+            return "无控制通道"
+        parts = []
+        for offset, is_limited in enumerate(limited):
+            name = names[offset] if offset < len(names) else f"ctrl[{address + offset}]"
+            label = f"{name} · ctrl[{address + offset}]"
+            value = self._format_array(ranges[offset]) if is_limited else "无限制"
+            parts.append(f"{label}: {value}")
+        return "; ".join(parts)
+
     def closeEvent(self, event) -> None:
         self.engine.close()
         super().closeEvent(event)
+
+
+if __name__ == "__main__":
+    # Allow VS Code's Run button to launch this module directly as well.
+    from main import main
+
+    raise SystemExit(main())
