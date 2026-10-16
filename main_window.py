@@ -1,6 +1,6 @@
 """平台工作台主窗口。
 
-本轮只重新组织界面和增加模型结构查看；MuJoCo仿真与控制器仍由原模块负责。
+界面只负责发出运行命令和显示状态；实际计时与物理步进由SimulationEngine负责。
 """
 
 from html import escape
@@ -10,6 +10,7 @@ import numpy as np
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
@@ -214,6 +215,22 @@ class MainWindow(QMainWindow):
         self.timestep_label = QLabel("- s")
         timeline_layout.addWidget(timestep_caption)
         timeline_layout.addWidget(self.timestep_label)
+        step_caption = QLabel("物理步数")
+        step_caption.setObjectName("mutedText")
+        self.step_count_label = QLabel("0")
+        self.step_count_label.setObjectName("timeValue")
+        timeline_layout.addWidget(step_caption)
+        timeline_layout.addWidget(self.step_count_label)
+        speed_caption = QLabel("仿真速度")
+        speed_caption.setObjectName("mutedText")
+        self.speed_combo = QComboBox()
+        self.speed_combo.setToolTip("仿真时间相对于现实时间的速度")
+        for label, value in (("0.25×", 0.25), ("0.5×", 0.5), ("1×", 1.0), ("2×", 2.0)):
+            self.speed_combo.addItem(label, value)
+        self.speed_combo.setCurrentIndex(2)
+        self.speed_combo.currentIndexChanged.connect(self._change_speed)
+        timeline_layout.addWidget(speed_caption)
+        timeline_layout.addWidget(self.speed_combo)
         layout.addWidget(timeline)
 
         state_strip = QFrame()
@@ -361,8 +378,8 @@ class MainWindow(QMainWindow):
             QPushButton:hover { background: #f3f6f9; border-color: #aeb9c5; }
             QPushButton[role="primary"] { background: #1669b2; color: white; border-color: #1669b2; }
             QPushButton[role="primary"]:hover { background: #0f5d9f; }
-            QDoubleSpinBox { background: #ffffff; border: 1px solid #cfd7e0;
-                             border-radius: 5px; padding: 6px; }
+            QDoubleSpinBox, QComboBox { background: #ffffff; border: 1px solid #cfd7e0;
+                                       border-radius: 5px; padding: 6px; }
             QSplitter::handle { background: #dce2e9; width: 1px; }
             QStatusBar#statusBar { background: #ffffff; border-top: 1px solid #dce2e9; color: #687586; }
             QLabel#runStatus { color: #2e7d50; padding-right: 14px; }
@@ -382,6 +399,7 @@ class MainWindow(QMainWindow):
     def _load_model(self, path: Path) -> None:
         try:
             self.is_running = False
+            self.engine.pause_realtime()
             self._update_running_ui()
             self.engine.load_model(path)
             self.target_input.setValue(self.engine.target)
@@ -501,6 +519,10 @@ class MainWindow(QMainWindow):
         if not self.engine.is_loaded:
             return
         self.is_running = not self.is_running
+        if self.is_running:
+            self.engine.start_realtime()
+        else:
+            self.engine.pause_realtime()
         self._update_running_ui()
 
     def _update_running_ui(self) -> None:
@@ -521,9 +543,14 @@ class MainWindow(QMainWindow):
         self.engine.set_target(self.target_input.value())
         self.message_status_label.setText(f"目标已更新：{self.target_input.value():.4f}")
 
+    def _change_speed(self) -> None:
+        speed = float(self.speed_combo.currentData())
+        self.engine.set_speed_multiplier(speed)
+        self.message_status_label.setText(f"仿真速度已设为 {speed:g}×")
+
     def _on_timer(self) -> None:
         if self.is_running:
-            self.engine.step_for(self.DISPLAY_INTERVAL_MS / 1000.0)
+            self.engine.advance_realtime()
         self._refresh_state()
         self.render_widget.refresh_frame()
 
@@ -531,6 +558,7 @@ class MainWindow(QMainWindow):
         # MuJoCo -> GUI 的入口：界面只读取get_state()返回的副本。
         state = self.engine.get_state()
         self.time_label.setText(f"{state.time:.4f} s")
+        self.step_count_label.setText(str(state.physics_steps))
         self.qpos_text[1].setText(self._format_array(state.qpos))
         self.qvel_text[1].setText(self._format_array(state.qvel))
         self.ctrl_text[1].setText(self._format_array(state.ctrl))

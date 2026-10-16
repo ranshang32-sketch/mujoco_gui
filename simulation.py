@@ -5,6 +5,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
+import time
 
 import mujoco
 import numpy as np
@@ -20,9 +21,13 @@ class SimulationState:
     qpos: np.ndarray
     qvel: np.ndarray
     ctrl: np.ndarray
+    physics_steps: int
 
 
 class SimulationEngine:
+    MAX_WALL_DELTA = 0.1
+    MAX_STEPS_PER_UPDATE = 500
+
     def __init__(self) -> None:
         self.model: mujoco.MjModel | None = None
         self.data: mujoco.MjData | None = None
@@ -31,6 +36,11 @@ class SimulationEngine:
         self._renderer: mujoco.Renderer | None = None
         self._render_size = (0, 0)
         self.camera = mujoco.MjvCamera()
+        self._speed_multiplier = 1.0
+        self._clock_running = False
+        self._last_wall_time: float | None = None
+        self._time_accumulator = 0.0
+        self._physics_steps = 0
 
     @property
     def is_loaded(self) -> bool:
@@ -39,6 +49,10 @@ class SimulationEngine:
     @property
     def target(self) -> float:
         return self.controller.target
+
+    @property
+    def speed_multiplier(self) -> float:
+        return self._speed_multiplier
 
     def load_model(self, xml_path: str | Path) -> None:
         """加载一个 MuJoCo MJCF/XML，并创建全新的仿真状态。"""
@@ -56,6 +70,7 @@ class SimulationEngine:
         if hasattr(mujoco, "mjv_defaultFreeCamera"):
             mujoco.mjv_defaultFreeCamera(self.model, self.camera)
         self.controller.reset(self.model, self.data)
+        self._reset_clock()
 
     @staticmethod
     def _load_model_windows_safe(path: Path) -> mujoco.MjModel:
@@ -205,6 +220,78 @@ class SimulationEngine:
         mujoco.mj_resetData(self.model, self.data)
         mujoco.mj_forward(self.model, self.data)
         self.controller.reset(self.model, self.data)
+        self._reset_clock()
+
+    def set_speed_multiplier(self, value: float) -> None:
+        """设置仿真速度；它只影响之后经过的现实时间。"""
+        value = float(value)
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError("仿真速度必须是大于 0 的有限数值。")
+        self._speed_multiplier = value
+        if self._clock_running:
+            # 从现在重新计时，避免把切换速度前的时间按新速度计算。
+            self._last_wall_time = time.perf_counter()
+
+    def start_realtime(self, now: float | None = None) -> None:
+        """开始或恢复实时仿真，不把暂停期间的时间补算进去。"""
+        if not self.is_loaded:
+            return
+        self._clock_running = True
+        self._last_wall_time = time.perf_counter() if now is None else float(now)
+
+    def pause_realtime(self) -> None:
+        """暂停物理步进；保留不足一个 timestep 的小数时间。"""
+        self._clock_running = False
+        self._last_wall_time = None
+
+    def advance_realtime(self, now: float | None = None) -> int:
+        """按照实际经过时间执行所需数量的 ``mj_step``。
+
+        Qt 定时器只负责定期调用本方法，并不直接决定 MuJoCo 前进多少时间。
+        单次现实时间会被截断，并限制最大步数，防止窗口卡顿后疯狂补步。
+        """
+        if not self.is_loaded or not self._clock_running:
+            return 0
+
+        current = time.perf_counter() if now is None else float(now)
+        if self._last_wall_time is None:
+            self._last_wall_time = current
+            return 0
+
+        wall_delta = max(0.0, current - self._last_wall_time)
+        self._last_wall_time = current
+        wall_delta = min(wall_delta, self.MAX_WALL_DELTA)
+        self._time_accumulator += wall_delta * self._speed_multiplier
+
+        timestep = float(self.model.opt.timestep)
+        # 极小容差只用于抵消浮点表示误差，例如理论上的0.040/0.002
+        # 不应因为二进制小数略小于整数而少执行一步。
+        scheduled_steps = int((self._time_accumulator + timestep * 1e-9) / timestep)
+        if scheduled_steps <= 0:
+            return 0
+
+        # 无论是否触发上限，都丢弃已经调度的完整步时间，只保留不足一步的余量。
+        # 这样界面卡顿后不会形成永远追不完的积压。
+        self._time_accumulator = max(
+            0.0, self._time_accumulator - scheduled_steps * timestep
+        )
+        steps_to_run = min(scheduled_steps, self.MAX_STEPS_PER_UPDATE)
+        for _ in range(steps_to_run):
+            self._step_once()
+        return steps_to_run
+
+    def _reset_clock(self) -> None:
+        self._clock_running = False
+        self._last_wall_time = None
+        self._time_accumulator = 0.0
+        self._physics_steps = 0
+
+    def _step_once(self) -> None:
+        """计算一次控制输入，然后推进一个 MuJoCo 物理步。"""
+        if self.model.nu:
+            self.data.ctrl[:] = self.controller.compute(self.model, self.data)
+        mujoco.mj_step(self.model, self.data)
+        self._physics_steps += 1
 
     def step_for(self, duration: float) -> None:
         """推进指定的仿真时长，物理步长始终读取当前 model.opt.timestep。"""
@@ -216,20 +303,19 @@ class SimulationEngine:
         steps = 0
         while self.data.time < end_time and steps < max_steps:
             # GUI目标值 -> 控制器 -> data.ctrl -> MuJoCo。
-            if self.model.nu:
-                self.data.ctrl[:] = self.controller.compute(self.model, self.data)
-            mujoco.mj_step(self.model, self.data)
+            self._step_once()
             steps += 1
 
     def get_state(self) -> SimulationState:
         """仿真 -> GUI：复制状态，避免 GUI 意外改写 MuJoCo 内部数组。"""
         if not self.is_loaded:
-            return SimulationState(0.0, np.array([]), np.array([]), np.array([]))
+            return SimulationState(0.0, np.array([]), np.array([]), np.array([]), 0)
         return SimulationState(
             time=float(self.data.time),
             qpos=self.data.qpos.copy(),
             qvel=self.data.qvel.copy(),
             ctrl=self.data.ctrl.copy(),
+            physics_steps=self._physics_steps,
         )
 
     def render(self, width: int, height: int) -> np.ndarray | None:
